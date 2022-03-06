@@ -3,65 +3,28 @@
 namespace AliReaza\EventDriven\Kafka;
 
 use AliReaza\EventDriven\EventDrivenListenerInterface;
-use AliReaza\UUID\V4 as UUID_V4;
 use Closure;
-use Exception;
 use Psr\EventDispatcher\ListenerProviderInterface;
 use RdKafka\Conf;
 use RdKafka\KafkaConsumer;
 use RdKafka\Message;
-use ReflectionClass;
-use Throwable;
 
-/**
- * Class ListenerProvider
- *
- * @package AliReaza\EventDriven\Kafka
- */
 class ListenerProvider implements ListenerProviderInterface, EventDrivenListenerInterface
 {
-    private Conf $connection;
-
     private bool $unsubscribe = false;
     private ?Closure $message_provider = null;
     private ?Closure $listener_provider = null;
-
+    private int $consumer_timeout_ms = 60 * 1000;
     public array $listeners = [];
+    private ?array $partitions = null;
 
-    public function __construct(public string $servers)
+    public function __construct(public Conf $conf)
     {
-        $this->connection = new Conf();
-        $this->connection->set('bootstrap.servers', $this->servers);
-
-        $this->connection->setRebalanceCb(function (KafkaConsumer $kafka, $err, array $partitions = null) {
-            switch ($err) {
-                case RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS:
-                    echo ' [.] Assign: ';
-                    var_dump($partitions);
-                    $kafka->assign($partitions);
-                    break;
-
-                case RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
-                    echo ' [.] Revoke: ';
-                    var_dump($partitions);
-                    $kafka->assign();
-                    break;
-
-                default:
-                    throw new Exception($err);
-            }
-        });
-
-        $this->connection->set('auto.offset.reset', 'earliest');
-        $this->connection->set('session.timeout.ms', (string)10 * 1000);
-
-        $this->connection->set('group.id', 'G-' . ((string)new UUID_V4()));
     }
 
     public function getListenersForEvent(object $event): iterable
     {
-        $reflect = new ReflectionClass($event);
-        $name = $reflect->getShortName();
+        $name = str_replace('\\', '.', $event::class);
 
         if (array_key_exists($name, $this->listeners)) {
             return $this->listeners[$name];
@@ -70,40 +33,48 @@ class ListenerProvider implements ListenerProviderInterface, EventDrivenListener
         return [];
     }
 
-    /**
-     * @throws Throwable
-     */
-    public function subscribe(): void
+    public function subscribe(int $timeout_ms = 0): void
     {
-        $consumer = new KafkaConsumer($this->connection);
+        $consumer = new KafkaConsumer($this->conf);
 
-        $events = array_keys($this->listeners);
+        $consumer->assign($this->partitions);
+
+        $events = array_map(function ($event_name) {
+            return str_replace('\\', '.', $event_name);
+        }, array_keys($this->listeners));
 
         $consumer->subscribe($events);
 
-        $dispatcher = new EventDispatcher($this->servers);
-
         $this->unsubscribe(false);
-        while (!$this->unsubscribe) {
-            $message = $consumer->consume(2 * 60 * 1000);
 
-            if (array_key_exists($message->topic_name, $this->listeners)) {
+        $start_time = microtime(true);
+
+        while (!$this->unsubscribe) {
+            $message = $consumer->consume($timeout_ms > 0 ? $timeout_ms : $this->consumer_timeout_ms);
+
+            if (is_null($message->topic_name)) continue;
+
+            $topic_name = str_replace('.', '\\', $message->topic_name);
+
+            if (array_key_exists($topic_name, $this->listeners)) {
                 $message = $this->messageHandler($message);
 
-                foreach ($this->listeners[$message->topic_name] as $listener) {
-                    $headers = $message->headers;
+                foreach ($this->listeners[$topic_name] as $listener) {
+                    $this->listenerHandler($topic_name, $listener, $message);
+                }
+            }
 
-                    if (!is_null($headers) && array_key_exists('correlation_id', $headers)) {
-                        $dispatcher->setCorrelationId($headers['correlation_id']);
-                        $dispatcher->setCausationId($headers['event_id']);
-                    }
+            if ($timeout_ms > 0) {
+                $time_elapsed_ms = (microtime(true) - $start_time) * 1000;
 
-                    $this->listenerHandler($listener, $message, $dispatcher);
+                if ($time_elapsed_ms > $timeout_ms) {
+                    $this->unsubscribe();
                 }
             }
         }
 
         $consumer->unsubscribe();
+
         $consumer->close();
     }
 
@@ -132,7 +103,7 @@ class ListenerProvider implements ListenerProviderInterface, EventDrivenListener
         $this->message_provider = $provider;
     }
 
-    public function listenerHandler(mixed $listener, Message $message, EventDispatcher $dispatcher): void
+    public function listenerHandler(string $event, mixed $listener, Message $message): void
     {
         if (is_null($this->listener_provider)) {
             if (is_string($listener)) {
@@ -143,11 +114,11 @@ class ListenerProvider implements ListenerProviderInterface, EventDrivenListener
                 $listener = Closure::fromCallable($listener);
             }
 
-            $listener($message, $dispatcher);
+            $listener($event, $message);
         } else {
             $provider = $this->listener_provider;
 
-            $provider($listener, $message, $dispatcher);
+            $provider($event, $listener, $message);
         }
     }
 
@@ -162,5 +133,15 @@ class ListenerProvider implements ListenerProviderInterface, EventDrivenListener
         }
 
         $this->listener_provider = $provider;
+    }
+
+    public function setConsumerTimeoutMs(int $consumer_timeout_ms): void
+    {
+        $this->consumer_timeout_ms = $consumer_timeout_ms;
+    }
+
+    public function setPartitions(?array $partitions = null): void
+    {
+        $this->partitions = $partitions;
     }
 }

@@ -2,52 +2,49 @@
 
 namespace AliReaza\EventDriven\Kafka;
 
+use AliReaza\EventDriven\EventDrivenInterface;
+use AliReaza\UUID\V4 as UUID_V4;
 use Closure;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use RdKafka\Conf;
-use ReflectionClass;
 use RdKafka\Producer;
-use AliReaza\EventDriven\EventDrivenInterface;
-use AliReaza\UUID\V4 as UUID_V4;
 
-/**
- * Class EventDispatcher
- *
- * @package AliReaza\EventDriven\Kafka
- */
 class EventDispatcher implements EventDispatcherInterface, EventDrivenInterface
 {
-    private Conf $connection;
     private ?Closure $message_provider = null;
+    private int $partition = RD_KAFKA_PARTITION_UA;
+    private int $msg_flags = RD_KAFKA_MSG_F_BLOCK;
+    private int $timeout_ms = 10000;
     private ?string $event_id = null;
     private ?string $correlation_id = null;
     private ?string $causation_id = null;
 
-    public function __construct(public string $servers)
+    public function __construct(public Conf $conf)
     {
-        $this->connection = new Conf();
-        $this->connection->set('bootstrap.servers', $this->servers);
     }
 
     public function dispatch(object $event): object
     {
-        $this->event_id = null;
+        $name = str_replace('\\', '.', $event::class);
 
-        $reflect = new ReflectionClass($event);
-        $name = $reflect->getShortName();
-
-        $producer = new Producer($this->connection);
+        $producer = new Producer($this->conf);
         $topic = $producer->newTopic($name);
 
         $payload = $this->messageHandler($event);
 
-        $topic->producev(RD_KAFKA_PARTITION_UA, 0, $payload, null, [
+        $topic->producev($this->partition, $this->msg_flags, $payload, null, [
             'event_id' => $this->getEventId(),
             'correlation_id' => $this->getCorrelationId(),
             'causation_id' => $this->getCausationId(),
         ]);
 
-        $producer->flush(10 * 1000);
+        while ($producer->getOutQLen() > 0) {
+            $producer->poll($this->timeout_ms);
+        }
+
+        $this->event_id = null;
+        $this->correlation_id = null;
+        $this->causation_id = null;
 
         return $event;
     }
@@ -99,5 +96,20 @@ class EventDispatcher implements EventDispatcherInterface, EventDrivenInterface
     public function getCausationId(): string
     {
         return $this->causation_id ?? $this->getEventId();
+    }
+
+    public function setPartition(int $partition): void
+    {
+        $this->partition = $partition;
+    }
+
+    public function setMsgFlags(int $msg_flags): void
+    {
+        $this->msg_flags = $msg_flags;
+    }
+
+    public function setTimeoutMs(int $timeout_ms): void
+    {
+        $this->timeout_ms = $timeout_ms;
     }
 }
